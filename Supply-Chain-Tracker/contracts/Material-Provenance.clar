@@ -14,11 +14,15 @@
 (define-constant ERR-PARTICIPANT-NOT-FOUND (err u108))
 (define-constant ERR-INVALID-CERTIFICATION (err u109))
 (define-constant ERR-MATERIAL-ALREADY-PROCESSED (err u110))
+(define-constant ERR-INVALID-INPUT (err u111))
 
 ;; Contract constants
 (define-constant CONTRACT-OWNER tx-sender)
 (define-constant MAX-STRING-LENGTH u256)
 (define-constant MIN-QUANTITY u1)
+(define-constant MAX-TEMPERATURE 1000)
+(define-constant MIN-TEMPERATURE -1000)
+(define-constant MAX-HUMIDITY u100)
 
 ;; Status constants for material lifecycle tracking
 (define-constant STATUS-SOURCED u1)
@@ -114,20 +118,17 @@
   )
 )
 
+;; Validation function to check if a principal is valid (not zero address)
+(define-private (is-valid-principal (participant principal))
+  (not (is-eq participant 'ST000000000000000000002AMW42H))
+)
+
 ;; Validation function to check if status transition is valid
 (define-private (is-valid-status-transition (current-status uint) (new-status uint))
   (and
     (<= current-status new-status)          ;; Status can only move forward
     (>= new-status STATUS-SOURCED)         ;; Must be at least sourced
     (<= new-status STATUS-DELIVERED)       ;; Cannot exceed delivered
-  )
-)
-
-;; Validation function for string length constraints
-(define-private (is-valid-string-length (str (string-ascii 256)))
-  (and
-    (> (len str) u0)                       ;; String cannot be empty
-    (<= (len str) MAX-STRING-LENGTH)       ;; String cannot exceed max length
   )
 )
 
@@ -153,13 +154,18 @@
   (begin
     ;; Only contract owner can authorize participants
     (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-UNAUTHORIZED-ACCESS)
+    ;; Validate participant principal
+    (asserts! (is-valid-principal participant) ERR-INVALID-PARTICIPANT)
     ;; Validate input parameters
-    (asserts! (is-valid-string-length name) ERR-INVALID-PARTICIPANT)
-    (asserts! (is-valid-string-length role) ERR-INVALID-PARTICIPANT)
-    (asserts! (is-valid-string-length location) ERR-INVALID-LOCATION)
+    (asserts! (and (> (len name) u0) (<= (len name) u64)) ERR-INVALID-PARTICIPANT)
+    (asserts! (and (> (len role) u0) (<= (len role) u32)) ERR-INVALID-PARTICIPANT)
+    (asserts! (and (> (len location) u0) (<= (len location) u128)) ERR-INVALID-LOCATION)
+    (asserts! (<= (len certifications) u5) ERR-INVALID-CERTIFICATION)
+    ;; Validate participant is not already authorized to prevent duplicates
+    (asserts! (is-none (get is-active (map-get? authorized-participants { participant: participant }))) ERR-DUPLICATE-MATERIAL)
     
     ;; Store participant information
-    (map-set authorized-participants
+    (ok (map-set authorized-participants
       { participant: participant }
       {
         name: name,
@@ -170,8 +176,7 @@
         certifications: certifications,
         is-active: true
       }
-    )
-    (ok true)
+    ))
   )
 )
 
@@ -180,17 +185,20 @@
   (begin
     ;; Only contract owner can deactivate participants
     (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-UNAUTHORIZED-ACCESS)
+    ;; Validate participant principal
+    (asserts! (is-valid-principal participant) ERR-INVALID-PARTICIPANT)
     
-    ;; Check if participant exists
+    ;; Check if participant exists and get their data
     (match (map-get? authorized-participants { participant: participant })
       participant-data
       (begin
+        ;; Verify participant is currently active
+        (asserts! (get is-active participant-data) ERR-PARTICIPANT-NOT-FOUND)
         ;; Update participant status to inactive
-        (map-set authorized-participants
+        (ok (map-set authorized-participants
           { participant: participant }
           (merge participant-data { is-active: false })
-        )
-        (ok true)
+        ))
       )
       ERR-PARTICIPANT-NOT-FOUND
     )
@@ -215,12 +223,25 @@
     ;; Validate material doesn't already exist
     (asserts! (is-none (map-get? materials { material-id: material-id })) ERR-DUPLICATE-MATERIAL)
     ;; Validate input parameters
-    (asserts! (is-valid-string-length material-id) ERR-INVALID-PARTICIPANT)
-    (asserts! (is-valid-string-length origin) ERR-INVALID-LOCATION)
+    (asserts! (and (> (len material-id) u0) (<= (len material-id) u64)) ERR-INVALID-INPUT)
+    (asserts! (and (> (len origin) u0) (<= (len origin) u128)) ERR-INVALID-LOCATION)
     (asserts! (>= quantity MIN-QUANTITY) ERR-INVALID-QUANTITY)
-    (asserts! (is-valid-string-length unit) ERR-INVALID-PARTICIPANT)
-    (asserts! (is-valid-string-length location) ERR-INVALID-LOCATION)
-    (asserts! (is-valid-string-length batch-number) ERR-INVALID-PARTICIPANT)
+    (asserts! (and (> (len unit) u0) (<= (len unit) u32)) ERR-INVALID-INPUT)
+    (asserts! (<= (len certifications) u10) ERR-INVALID-CERTIFICATION)
+    (asserts! (and (> (len location) u0) (<= (len location) u128)) ERR-INVALID-LOCATION)
+    (asserts! (and (> (len batch-number) u0) (<= (len batch-number) u32)) ERR-INVALID-INPUT)
+    ;; Validate temperature range if provided
+    (asserts! (match temperature
+      temp-val (and (>= temp-val MIN-TEMPERATURE) (<= temp-val MAX-TEMPERATURE))
+      true) ERR-INVALID-INPUT)
+    ;; Validate humidity range if provided
+    (asserts! (match humidity
+      hum-val (<= hum-val MAX-HUMIDITY)
+      true) ERR-INVALID-INPUT)
+    ;; Validate expiry date if provided
+    (asserts! (match expiry-date
+      exp-val (> exp-val block-height)
+      true) ERR-INVALID-INPUT)
     
     ;; Register the material
     (map-set materials
@@ -276,8 +297,17 @@
     ;; Verify caller is authorized participant
     (asserts! (is-authorized-participant tx-sender) ERR-UNAUTHORIZED-ACCESS)
     ;; Validate input parameters
-    (asserts! (is-valid-string-length new-location) ERR-INVALID-LOCATION)
-    (asserts! (is-valid-string-length details) ERR-INVALID-PARTICIPANT)
+    (asserts! (and (> (len material-id) u0) (<= (len material-id) u64)) ERR-INVALID-INPUT)
+    (asserts! (and (> (len new-location) u0) (<= (len new-location) u128)) ERR-INVALID-LOCATION)
+    (asserts! (and (> (len details) u0) (<= (len details) u256)) ERR-INVALID-INPUT)
+    ;; Validate temperature range if provided
+    (asserts! (match temperature
+      temp-val (and (>= temp-val MIN-TEMPERATURE) (<= temp-val MAX-TEMPERATURE))
+      true) ERR-INVALID-INPUT)
+    ;; Validate humidity range if provided
+    (asserts! (match humidity
+      hum-val (<= hum-val MAX-HUMIDITY)
+      true) ERR-INVALID-INPUT)
     
     ;; Get current material data
     (match (map-get? materials { material-id: material-id })
@@ -332,11 +362,14 @@
   (begin
     ;; Verify caller is authorized participant
     (asserts! (is-authorized-participant tx-sender) ERR-UNAUTHORIZED-ACCESS)
+    ;; Validate new owner principal
+    (asserts! (is-valid-principal new-owner) ERR-INVALID-PARTICIPANT)
     ;; Verify new owner is authorized participant
     (asserts! (is-authorized-participant new-owner) ERR-UNAUTHORIZED-ACCESS)
     ;; Validate input parameters
-    (asserts! (is-valid-string-length transfer-location) ERR-INVALID-LOCATION)
-    (asserts! (is-valid-string-length details) ERR-INVALID-PARTICIPANT)
+    (asserts! (and (> (len material-id) u0) (<= (len material-id) u64)) ERR-INVALID-INPUT)
+    (asserts! (and (> (len transfer-location) u0) (<= (len transfer-location) u128)) ERR-INVALID-LOCATION)
+    (asserts! (and (> (len details) u0) (<= (len details) u256)) ERR-INVALID-INPUT)
     
     ;; Get current material data
     (match (map-get? materials { material-id: material-id })
@@ -390,8 +423,9 @@
     ;; Verify caller is authorized participant
     (asserts! (is-authorized-participant tx-sender) ERR-UNAUTHORIZED-ACCESS)
     ;; Validate input parameters
-    (asserts! (is-valid-string-length reason) ERR-INVALID-PARTICIPANT)
-    (asserts! (is-valid-string-length location) ERR-INVALID-LOCATION)
+    (asserts! (and (> (len material-id) u0) (<= (len material-id) u64)) ERR-INVALID-INPUT)
+    (asserts! (and (> (len reason) u0) (<= (len reason) u128)) ERR-INVALID-INPUT)
+    (asserts! (and (> (len location) u0) (<= (len location) u128)) ERR-INVALID-LOCATION)
     
     ;; Get current material data
     (match (map-get? materials { material-id: material-id })
@@ -456,8 +490,13 @@
     ;; Verify caller is authorized participant
     (asserts! (is-authorized-participant tx-sender) ERR-UNAUTHORIZED-ACCESS)
     ;; Validate input parameters
-    (asserts! (is-valid-string-length standard-id) ERR-INVALID-CERTIFICATION)
-    (asserts! (is-valid-string-length certificate-hash) ERR-INVALID-CERTIFICATION)
+    (asserts! (and (> (len material-id) u0) (<= (len material-id) u64)) ERR-INVALID-INPUT)
+    (asserts! (and (> (len standard-id) u0) (<= (len standard-id) u32)) ERR-INVALID-CERTIFICATION)
+    (asserts! (and (> (len certificate-hash) u0) (<= (len certificate-hash) u64)) ERR-INVALID-CERTIFICATION)
+    ;; Validate expiry date if provided
+    (asserts! (match expiry-date
+      exp-val (> exp-val block-height)
+      true) ERR-INVALID-INPUT)
     
     ;; Verify material exists
     (asserts! (is-some (map-get? materials { material-id: material-id })) ERR-MATERIAL-NOT-FOUND)
@@ -506,9 +545,10 @@
     ;; Only authorized participants can create standards
     (asserts! (is-authorized-participant tx-sender) ERR-UNAUTHORIZED-ACCESS)
     ;; Validate input parameters
-    (asserts! (is-valid-string-length standard-id) ERR-INVALID-CERTIFICATION)
-    (asserts! (is-valid-string-length name) ERR-INVALID-CERTIFICATION)
-    (asserts! (is-valid-string-length description) ERR-INVALID-CERTIFICATION)
+    (asserts! (and (> (len standard-id) u0) (<= (len standard-id) u32)) ERR-INVALID-CERTIFICATION)
+    (asserts! (and (> (len name) u0) (<= (len name) u64)) ERR-INVALID-CERTIFICATION)
+    (asserts! (and (> (len description) u0) (<= (len description) u256)) ERR-INVALID-CERTIFICATION)
+    (asserts! (<= (len requirements) u10) ERR-INVALID-CERTIFICATION)
     
     ;; Create quality standard
     (map-set quality-standards
@@ -577,7 +617,7 @@
   )
 )
 
-;; Read-only function to get materials by owner
+;; Read-only function to get materials by status
 (define-read-only (get-materials-by-status (target-status uint))
   (ok target-status)
 )
